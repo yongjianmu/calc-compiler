@@ -1,0 +1,4 @@
+/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/calc-compiler/build/CMakeFiles/edit_cache.dir
+/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/calc-compiler/build/CMakeFiles/rebuild_cache.dir
+/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/calc-compiler/build/CMakeFiles/check-all.dir
+/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/calc-compiler/build/CMakeFiles/calcc.dir

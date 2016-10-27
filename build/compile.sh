@@ -1,0 +1,1 @@
+../../cmake-3.6.2-Linux-x86_64/bin/cmake .. -DLLVM_DIR=/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/build/lib/cmake/llvm -DCMAKE_CXX_COMPILER=/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/build/bin/clang++ -DCMAKE_C_COMPILER=/mnt/hgfs/Documents/UTAH/AdvancedCompiler/project/build/bin/clang -DCMAKE_BUILD_TYPE=Debug
