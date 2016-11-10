@@ -17,6 +17,8 @@
 
 /********************************************************************
  * !! REFERENCE CODE: http://llvm.org/docs/tutorial/LangImpl03.html *
+ *                    http://llvm.org/docs/tutorial/LangImpl05.html *
+ *                    http://llvm.org/docs/tutorial/LangImpl07.html *
  ********************************************************************/
 
 using namespace llvm;
@@ -25,7 +27,8 @@ using namespace std;
 static LLVMContext C;
 static IRBuilder<NoFolder> Builder(C);
 static std::unique_ptr<Module> M = llvm::make_unique<Module>("calc", C);
-static std::map<string, Value*> NamedValues;
+static std::map<string, Value*> NamedValues; // a0 ~ a5
+static std::map<string, Value*> NamedMValues; // m0 ~ m9
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -67,7 +70,16 @@ static int gettok() {
           IdentifierStr.push_back(LastChar);
 
         if (IdentifierStr.compare("if") == 0) {
-            return TOK_BR;
+            return TOK_BR_IF;
+        }
+        else if(IdentifierStr.compare("while") == 0){
+            return TOK_BR_WHILE;
+        }
+        else if(IdentifierStr.compare("set") == 0){
+            return TOK_SET;
+        }
+        else if(IdentifierStr.compare("seq") == 0){
+            return TOK_SEQ;
         }
 
         if ((IdentifierStr.compare("true") == 0) || (IdentifierStr.compare("false") == 0)) {
@@ -162,6 +174,23 @@ class VariableExprAST : public ExprAST {
     }
 };
 
+/// MVariableExprAST - Expression class for referencing a variable.
+// m0 ~ m9
+class MVariableExprAST : public ExprAST {
+    string str;
+
+    public:
+    MVariableExprAST(string STR) : str(STR) {}
+    Value *codegen()
+    {
+        return NamedMValues[str];
+    }
+    string getName()
+    {
+        return str;
+    }
+};
+
 /// BinaryExprAST - Expression class for a binary operator.
 class BinaryExprAST : public ExprAST {
     int Op;
@@ -243,15 +272,129 @@ class BoolExprAST : public ExprAST {
 };
 
 /// BRExprAST - Expression class for if statement
-class BRExprAST : public ExprAST {
+class BRIfExprAST : public ExprAST {
     std::unique_ptr<ExprAST> St, Br1, Br2;
 
     public:
-    BRExprAST(std::unique_ptr<ExprAST> St, std::unique_ptr<ExprAST> Br1, std::unique_ptr<ExprAST> Br2)
-        : St(std::move(St)), Br1(std::move(Br1)), Br2(std::move(Br2)) {}
+    BRIfExprAST(std::unique_ptr<ExprAST> St, std::unique_ptr<ExprAST> Br1, std::unique_ptr<ExprAST> Br2) : St(std::move(St)), Br1(std::move(Br1)), Br2(std::move(Br2)) {}
     Value* codegen()
     {
-        // TODO: codegen for Branch expresstion
+        PHINode* ret = nullptr;
+        Value* VST = St->codegen();
+        if (nullptr != VST)
+        {
+            VST = Builder.CreateFCmpONE(VST, ConstantFP::get(C, APFloat(0.0)), "ifcond");
+
+            Function* FP = Builder.GetInsertBlock()->getParent();
+            BasicBlock* BBr1 = BasicBlock::Create(C, "br1", FP);
+            BasicBlock* BBr2 = BasicBlock::Create(C, "br2");
+            BasicBlock* BBr3 = BasicBlock::Create(C);
+            Builder.CreateCondBr(VST, BBr1, BBr2);
+
+            Builder.SetInsertPoint(BBr1);
+            Value* VBr1 = Br1->codegen();
+            if (nullptr == VBr1)
+            {
+                return ret;
+            }
+            Builder.CreateBr(BBr3);
+            BBr1 = Builder.GetInsertBlock();
+
+            FP->getBasicBlockList().push_back(BBr2);
+            Builder.SetInsertPoint(BBr2);
+            Value* VBr2 = Br2->codegen();
+            if (nullptr == VBr2)
+            {
+                return ret;
+            }
+            Builder.CreateBr(BBr3);
+            BBr2 = Builder.GetInsertBlock();
+
+            FP->getBasicBlockList().push_back(BBr3);
+            Builder.SetInsertPoint(BBr3);
+
+            ret = Builder.CreatePHI(Type::getInt64Ty(C), 2, "IFTMP");
+            ret->addIncoming(VBr2, BBr1);
+            ret->addIncoming(VBr2, BBr2);
+        }
+
+        return ret;
+    }
+};
+
+class BRWhileExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> op, var;
+    public:
+    BRWhileExprAST(std::unique_ptr<ExprAST> op, std::unique_ptr<ExprAST> var) : op(std::move(op)), var(std::move(var)) {}
+    Value* codegen()
+    {
+        // TODO: while expression
+        //return nullptr;
+        PHINode* ret = nullptr;
+        Value* VOp = op->codegen(); 
+
+        if(nullptr != VOp)
+        {
+            Function* FP = Builder.GetInsertBlock()->getParent();
+            BasicBlock* BOp = BasicBlock::Create(C, "op", FP);
+            BasicBlock* BVar = BasicBlock::Create(C, "var");
+            Builder.CreateCondBr(VOp, BOp, BVar);
+
+            Builder.SetInsertPoint(BOp);
+            Value* VBOp = var->codegen();
+            if(nullptr == VBOp)
+            {
+                return ret;
+            }
+            Builder.CreateBr(BVar);
+
+            Builder.SetInsertPoint(BVar);
+            ret = Builder.CreatePHI(Type::getInt64Ty(C), 2, "WHILETMP");
+            ret->addIncoming(VBOp, BVar);
+        }
+
+        return ret;
+    }
+};
+
+
+// Set and Seq Expression
+class SetExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> src, dst;
+    public:
+    SetExprAST(std::unique_ptr<ExprAST> src, std::unique_ptr<ExprAST> dst) : src(std::move(src)), dst(std::move(dst)) {}
+    Value* codegen()
+    {
+        MVariableExprAST *LHSE = static_cast<MVariableExprAST *>(dst.get());
+        if (nullptr != LHSE)
+          return nullptr;
+        // Codegen the RHS.
+        Value *Val = src->codegen();
+        if (!Val)
+          return nullptr;
+
+        // Look up the name.
+        Value *Variable = NamedMValues[LHSE->getName()];
+        if (!Variable)
+          return nullptr;
+
+        Builder.CreateStore(Val, Variable);
+        return Val;
+    }
+};
+
+class SeqExprAST : public ExprAST {
+    std::unique_ptr<ExprAST> first, second;
+    public:
+    SeqExprAST(std::unique_ptr<ExprAST> first, std::unique_ptr<ExprAST> second) : first(std::move(first)), second(std::move(second)) {}
+    Value* codegen()
+    {
+        Value* Vfirst = first->codegen();
+        Value* Vsecond = second->codegen();
+        if ((Vfirst != nullptr) && (Vsecond != nullptr))
+        {
+            return Vsecond;
+        }
         return nullptr;
     }
 };
@@ -272,21 +415,45 @@ static int getNextToken()
 
 static std::unique_ptr<ExprAST> MainLoop();
 
-static std::unique_ptr<ExprAST> ParseBRExpr()
+static std::unique_ptr<ExprAST> ParseIfExpr()
 {
-    std::unique_ptr<ExprAST> ret = nullptr;
     getNextToken(); 
-    // TODO: Branch expression
-    return ret;
+    std::unique_ptr<ExprAST> var[3];
+    for(int i = 0; i < 3; ++i)
+    {
+        var[i] = MainLoop();
+    }
+    return ((var[0] != nullptr) && (var[1] != nullptr) && (var[2] != nullptr)) ? make_unique<BRIfExprAST>(std::move(var[0]), std::move(var[1]), std::move(var[2])) : nullptr; 
+}
+
+static std::unique_ptr<ExprAST> ParseWhileExpr()
+{
+    getNextToken(); 
+    auto op = MainLoop(), st = MainLoop();
+    return ((nullptr != op) && (nullptr != st)) ? make_unique<BRWhileExprAST>(std::move(op), std::move(st)) : nullptr;
+}
+
+static std::unique_ptr<ExprAST> ParseSetExpr()
+{
+    getNextToken(); 
+    auto src = MainLoop(), dst = MainLoop();
+    return ((nullptr != src) && (nullptr != dst)) ? make_unique<SetExprAST>(std::move(src), std::move(dst)) : nullptr;
+}
+
+static std::unique_ptr<ExprAST> ParseSeqExpr()
+{
+    getNextToken(); 
+    auto first = MainLoop(), second = MainLoop();
+    return ((nullptr != first) && (nullptr != second)) ? make_unique<SeqExprAST>(std::move(first), std::move(second)) : nullptr;
 }
 
 static std::unique_ptr<ExprAST> ParseOPExpr()
 {
-    std::unique_ptr<ExprAST> ret = nullptr;
     int Cur_OP = Opera;
     getNextToken();
-    // TODO: OP expression
-    return ret;
+    auto LHS = MainLoop(), RHS = MainLoop();
+    return ((LHS != nullptr) && (RHS != nullptr)) ? make_unique<BinaryExprAST>(Cur_OP, std::move(LHS), std::move(RHS)) : nullptr;
+
 }
 
 static std::unique_ptr<ExprAST> MainLoop() {
@@ -305,21 +472,39 @@ static std::unique_ptr<ExprAST> MainLoop() {
                 getNextToken();
                 break;
             case TOK_VAR:
-                assert(IdentifierStr == "a0" || IdentifierStr == "a1" || IdentifierStr == "a2" || IdentifierStr == "a3" || IdentifierStr == "a4" || IdentifierStr == "a5");
+                if(IdentifierStr == "a0" || IdentifierStr == "a1" || IdentifierStr == "a2" || IdentifierStr == "a3" || IdentifierStr == "a4" || IdentifierStr == "a5")
+                {
+                    result = make_unique<VariableExprAST>(IdentifierStr);
+                }
+                else if(IdentifierStr == "m0" ||IdentifierStr == "m1" || IdentifierStr == "m2" || IdentifierStr == "m3" || IdentifierStr == "m4" || IdentifierStr == "m5" || IdentifierStr == "m6" || IdentifierStr == "m7" || IdentifierStr == "m8" || IdentifierStr == "m9")
+                {
+                    result = make_unique<MVariableExprAST>(IdentifierStr);
+                }
 
-                result = make_unique<VariableExprAST>(IdentifierStr);
                 getNextToken();
                 break;
             case TOK_LBRA:
                 ++left_bracket;
                 getNextToken();
-                if(CurTok == TOK_BR)
+                if(CurTok == TOK_BR_IF)
                 {
-                    DFS = std::move(ParseBRExpr());
+                    DFS = std::move(ParseIfExpr());
                 }
                 else if(CurTok == TOK_OP)
                 {
                     DFS = std::move(ParseOPExpr());
+                }
+                else if(CurTok == TOK_BR_WHILE)
+                {
+                    DFS = std::move(ParseWhileExpr());
+                }
+                else if(CurTok == TOK_SET)
+                {
+                    DFS = std::move(ParseSetExpr());
+                }
+                else if(CurTok == TOK_SEQ)
+                {
+                    DFS = std::move(ParseSeqExpr());
                 }
                 else{/*This Branch should not be triggled*/}
                 break;
@@ -333,7 +518,7 @@ static std::unique_ptr<ExprAST> MainLoop() {
                 break;
         }
 
-        if(result)
+        if(nullptr != result)
         {
             Value* V = result->codegen();
             Builder.CreateRet(V);
@@ -375,6 +560,14 @@ static int compile() {
     // generate correct LLVM instead of just an empty function
     for (auto &Arg : F->args()) {
         NamedValues[Arg.getName()] = &Arg;
+    }
+
+    vector<string> str_dict = {"m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9"};
+    for (auto str : str_dict)
+    {
+        Value* V = Builder.CreateAlloca(Type::getInt64Ty(C), nullptr, str.c_str());
+        Builder.CreateStore(ConstantInt::get(C, APInt(64, 0, true)), V, false);
+        NamedMValues[str] = V;
     }
 
     initHashTable();
