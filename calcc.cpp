@@ -29,6 +29,9 @@ static IRBuilder<NoFolder> Builder(C);
 static std::unique_ptr<Module> M = llvm::make_unique<Module>("calc", C);
 static std::map<string, Value*> NamedValues; // a0 ~ a5
 static std::map<string, Value*> NamedMValues; // m0 ~ m9
+static bool gCheck = false;
+static int gPos;
+static int gOpPos;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -54,20 +57,30 @@ static int LastChar = ' ';
 
 static int gettok() {
     while (isspace(LastChar))
+    {
       LastChar = getchar();
+      ++gPos;
+    }
 
     if ((LastChar == '(') || (LastChar == ')')){
         IdentifierStr.clear();
         IdentifierStr.push_back(LastChar);
+        gOpPos = gPos;
         LastChar = getchar();
+        ++gPos;
         return IdentifierStr.back() == '(' ? TOK_LBRA : TOK_RBRA;
     } 
 
     if (isalpha(LastChar)) {
         IdentifierStr.clear();
         IdentifierStr.push_back(LastChar);
+        gOpPos = gPos;
         while (isalnum(LastChar = getchar()))
-          IdentifierStr.push_back(LastChar);
+        {
+            IdentifierStr.push_back(LastChar);
+            ++gPos;
+        }
+        ++gPos;
 
         if (IdentifierStr.compare("if") == 0) {
             return TOK_BR_IF;
@@ -94,7 +107,9 @@ static int gettok() {
         IdentifierStr.clear();
         do {
             IdentifierStr.push_back(LastChar);
+            gOpPos = gPos;
             LastChar = getchar();
+            ++gPos;
         } while (isdigit(LastChar));
 
         return TOK_NUMBER;
@@ -102,7 +117,11 @@ static int gettok() {
 
     // Comment until end of line.
     if (LastChar == '#' || LastChar == '$' || LastChar == '^' || LastChar == '.') {
-        do LastChar = getchar();
+        do 
+        {
+            LastChar = getchar();
+            ++gPos;
+        }
         while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
         if (LastChar != EOF)
           return gettok();
@@ -114,11 +133,14 @@ static int gettok() {
        ) 
     {
         IdentifierStr = LastChar;
+        gOpPos = gPos;
         LastChar = getchar();
+        ++gPos;
         if (isdigit(LastChar)) {
             do {
                 IdentifierStr += LastChar;
                 LastChar = getchar();
+                ++gPos;
             } while (isdigit(LastChar));
             NumVal = stoi(IdentifierStr);
             return TOK_NUMBER;
@@ -130,7 +152,9 @@ static int gettok() {
              )
         {
             IdentifierStr.push_back(LastChar);
+            gOpPos = gPos;
             LastChar = getchar();
+            ++gPos;
         }
         Opera = get_bin_op(IdentifierStr);
         if (Opera != op_none) {
@@ -146,6 +170,7 @@ static int gettok() {
 
     int ThisChar = LastChar;
     LastChar = getchar();
+    ++gPos;
     return ThisChar;
 }
 
@@ -157,6 +182,7 @@ static int gettok() {
 /// ExprAST - Base class for all expression nodes.
 class ExprAST {
     public:
+        ExprAST() {}
         virtual ~ExprAST() {}
         virtual Value *codegen() = 0;
 };
@@ -165,9 +191,10 @@ class ExprAST {
 // a0 ~ a5
 class VariableExprAST : public ExprAST {
     string str;
+    int pos;
 
     public:
-    VariableExprAST(string STR) : str(STR) {}
+    VariableExprAST(string STR, int pos) : str(STR), pos(pos) {}
     Value *codegen()
     {
         return NamedValues[str];
@@ -178,9 +205,10 @@ class VariableExprAST : public ExprAST {
 // m0 ~ m9
 class MVariableExprAST : public ExprAST {
     string str;
+    int pos;
 
     public:
-    MVariableExprAST(string STR) : str(STR) {}
+    MVariableExprAST(string STR, int pos) : str(STR), pos(pos) {}
     Value *codegen()
     {
         return NamedMValues[str];
@@ -192,12 +220,36 @@ class MVariableExprAST : public ExprAST {
 };
 
 /// BinaryExprAST - Expression class for a binary operator.
+
+FunctionType *OFT;
+Function* OF;
+static Value* genCodeCheck(Value* LHS, Value* RHS, Function* func, int pos)
+{
+    Function* FP = Builder.GetInsertBlock()->getParent();
+    BasicBlock* BB1 = BasicBlock::Create(C, "BB1", FP);
+    BasicBlock* BB2 = BasicBlock::Create(C, "BB2", FP);
+
+    Value* V = Builder.CreateCall(func, {LHS, RHS});
+    Value* v1 = Builder.CreateExtractValue(V, 0);
+    Value* v2 = Builder.CreateExtractValue(V, 1);
+    Builder.CreateCondBr(v2, BB1, BB2);
+
+    Builder.SetInsertPoint(BB2);
+    PHINode* ret = Builder.CreatePHI(Type::getInt64Ty(C), 2, "OF");
+    ret->addIncoming(v1, BB1);
+    ret->addIncoming(v1, BB2);
+    return ret;
+}
+
+
 class BinaryExprAST : public ExprAST {
     int Op;
     std::unique_ptr<ExprAST> SLHS, SRHS;
+    int pos;
+
     public:
-    BinaryExprAST(int op, std::unique_ptr<ExprAST> SLHS, std::unique_ptr<ExprAST> SRHS) 
-        : Op(op), SLHS(std::move(SLHS)), SRHS(std::move(SRHS)) {}
+    BinaryExprAST(int op, std::unique_ptr<ExprAST> SLHS, std::unique_ptr<ExprAST> SRHS, int pos) 
+        : Op(op), SLHS(std::move(SLHS)), SRHS(std::move(SRHS)), pos(pos) {}
     Value* codegen()
     {
         Value* V = nullptr, * LHS = SLHS->codegen(), * RHS = SRHS->codegen();
@@ -207,16 +259,48 @@ class BinaryExprAST : public ExprAST {
             switch(Op)
             {
                 case op_add:
-                    V = Builder.CreateAdd(LHS, RHS, "ADDTMP");
+                    if(gCheck)
+                    {
+                        Function* func = Intrinsic::getDeclaration(&*M, Intrinsic::sadd_with_overflow, {Type::getInt64Ty(C)});
+                        V = genCodeCheck(LHS, RHS, func, pos);
+                    }
+                    else
+                    {
+                        V = Builder.CreateAdd(LHS, RHS, "ADDTMP");
+                    }
                     break;
                 case op_sub:
-                    V = Builder.CreateSub(LHS, RHS, "SUBTMP");
+                    if(gCheck)
+                    {
+                        Function* func = Intrinsic::getDeclaration(&*M, Intrinsic::ssub_with_overflow, {Type::getInt64Ty(C)});
+                        V = genCodeCheck(LHS, RHS, func, pos);
+                    }
+                    else
+                    {
+                        V = Builder.CreateSub(LHS, RHS, "SUBTMP");
+                    }
                     break;
                 case op_mul:
-                    V = Builder.CreateMul(LHS, RHS, "MULTMP");
+                    if(gCheck)
+                    {
+                        Function* func = Intrinsic::getDeclaration(&*M, Intrinsic::smul_with_overflow, {Type::getInt64Ty(C)});
+                        V = genCodeCheck(LHS, RHS, func, pos);
+                    }
+                    else
+                    {
+                        V = Builder.CreateMul(LHS, RHS, "MULTMP");
+                    }
                     break;
                 case op_div:
-                    V = Builder.CreateSDiv(LHS, RHS, "DIVTMP");
+                    if(gCheck)
+                    {
+                        V = Builder.CreateICmpEQ(RHS, ConstantInt::get(Type::getInt64Ty(C), APInt::getNullValue(64)), "div overvflow");
+                        //TODO div check
+                    }
+                    else
+                    {
+                        V = Builder.CreateSDiv(LHS, RHS, "DIVTMP");
+                    }
                     break;
                 case op_mod:
                     V = Builder.CreateSRem(LHS, RHS, "MODTMP");
@@ -250,9 +334,10 @@ class BinaryExprAST : public ExprAST {
 /// NumberExprAST - Expression class for number.
 class NumberExprAST : public ExprAST {
     long long Val;
+    int pos;
 
     public:
-    NumberExprAST(long long Val) : Val(Val) {}
+    NumberExprAST(long long Val, int pos) : Val(Val), pos(pos) {}
     Value *codegen() 
     {
         return ConstantInt::get(C, APInt(64, Val, true));
@@ -262,9 +347,10 @@ class NumberExprAST : public ExprAST {
 /// BoolExprAST - Expression class for bool.
 class BoolExprAST : public ExprAST {
     bool Bool;
+    int pos;
 
     public:
-    BoolExprAST(bool Val) : Bool(Val) {}
+    BoolExprAST(bool Val, int pos) : Bool(Val), pos(pos) {}
     Value *codegen()
     {
         return Bool ? ConstantInt::get(C, APInt(64, 1)) : ConstantInt::get(C, APInt(64, 0));
@@ -274,9 +360,10 @@ class BoolExprAST : public ExprAST {
 /// BRExprAST - Expression class for if statement
 class BRIfExprAST : public ExprAST {
     std::unique_ptr<ExprAST> St, Br1, Br2;
+    int pos;
 
     public:
-    BRIfExprAST(std::unique_ptr<ExprAST> St, std::unique_ptr<ExprAST> Br1, std::unique_ptr<ExprAST> Br2) : St(std::move(St)), Br1(std::move(Br1)), Br2(std::move(Br2)) {}
+    BRIfExprAST(std::unique_ptr<ExprAST> St, std::unique_ptr<ExprAST> Br1, std::unique_ptr<ExprAST> Br2, int pos) : St(std::move(St)), Br1(std::move(Br1)), Br2(std::move(Br2)), pos(pos) {}
     Value* codegen()
     {
         PHINode* ret = nullptr;
@@ -324,12 +411,12 @@ class BRIfExprAST : public ExprAST {
 
 class BRWhileExprAST : public ExprAST {
     std::unique_ptr<ExprAST> op, var;
+    int pos;
+
     public:
-    BRWhileExprAST(std::unique_ptr<ExprAST> op, std::unique_ptr<ExprAST> var) : op(std::move(op)), var(std::move(var)) {}
+    BRWhileExprAST(std::unique_ptr<ExprAST> op, std::unique_ptr<ExprAST> var, int pos) : op(std::move(op)), var(std::move(var)), pos(pos) {}
     Value* codegen()
     {
-        // TODO: while expression
-        //return nullptr;
         PHINode* ret = nullptr;
         Value* VOp = op->codegen(); 
 
@@ -361,8 +448,10 @@ class BRWhileExprAST : public ExprAST {
 // Set and Seq Expression
 class SetExprAST : public ExprAST {
     std::unique_ptr<ExprAST> src, dst;
+    int pos;
+
     public:
-    SetExprAST(std::unique_ptr<ExprAST> src, std::unique_ptr<ExprAST> dst) : src(std::move(src)), dst(std::move(dst)) {}
+    SetExprAST(std::unique_ptr<ExprAST> src, std::unique_ptr<ExprAST> dst, int pos) : src(std::move(src)), dst(std::move(dst)), pos(pos) {}
     Value* codegen()
     {
         MVariableExprAST *LHSE = static_cast<MVariableExprAST *>(dst.get());
@@ -385,8 +474,10 @@ class SetExprAST : public ExprAST {
 
 class SeqExprAST : public ExprAST {
     std::unique_ptr<ExprAST> first, second;
+    int pos;
+
     public:
-    SeqExprAST(std::unique_ptr<ExprAST> first, std::unique_ptr<ExprAST> second) : first(std::move(first)), second(std::move(second)) {}
+    SeqExprAST(std::unique_ptr<ExprAST> first, std::unique_ptr<ExprAST> second, int pos) : first(std::move(first)), second(std::move(second)), pos(pos) {}
     Value* codegen()
     {
         Value* Vfirst = first->codegen();
@@ -417,42 +508,47 @@ static std::unique_ptr<ExprAST> MainLoop();
 
 static std::unique_ptr<ExprAST> ParseIfExpr()
 {
+    int pos = gOpPos;
     getNextToken(); 
     std::unique_ptr<ExprAST> var[3];
     for(int i = 0; i < 3; ++i)
     {
         var[i] = MainLoop();
     }
-    return ((var[0] != nullptr) && (var[1] != nullptr) && (var[2] != nullptr)) ? make_unique<BRIfExprAST>(std::move(var[0]), std::move(var[1]), std::move(var[2])) : nullptr; 
+    return ((var[0] != nullptr) && (var[1] != nullptr) && (var[2] != nullptr)) ? make_unique<BRIfExprAST>(std::move(var[0]), std::move(var[1]), std::move(var[2]), pos) : nullptr; 
 }
 
 static std::unique_ptr<ExprAST> ParseWhileExpr()
 {
+    int pos = gOpPos;
     getNextToken(); 
     auto op = MainLoop(), st = MainLoop();
-    return ((nullptr != op) && (nullptr != st)) ? make_unique<BRWhileExprAST>(std::move(op), std::move(st)) : nullptr;
+    return ((nullptr != op) && (nullptr != st)) ? make_unique<BRWhileExprAST>(std::move(op), std::move(st), pos) : nullptr;
 }
 
 static std::unique_ptr<ExprAST> ParseSetExpr()
 {
+    int pos = gOpPos;
     getNextToken(); 
     auto src = MainLoop(), dst = MainLoop();
-    return ((nullptr != src) && (nullptr != dst)) ? make_unique<SetExprAST>(std::move(src), std::move(dst)) : nullptr;
+    return ((nullptr != src) && (nullptr != dst)) ? make_unique<SetExprAST>(std::move(src), std::move(dst), pos) : nullptr;
 }
 
 static std::unique_ptr<ExprAST> ParseSeqExpr()
 {
+    int pos = gOpPos;
     getNextToken(); 
     auto first = MainLoop(), second = MainLoop();
-    return ((nullptr != first) && (nullptr != second)) ? make_unique<SeqExprAST>(std::move(first), std::move(second)) : nullptr;
+    return ((nullptr != first) && (nullptr != second)) ? make_unique<SeqExprAST>(std::move(first), std::move(second), pos) : nullptr;
 }
 
 static std::unique_ptr<ExprAST> ParseOPExpr()
 {
     int Cur_OP = Opera;
+    int pos = gOpPos;
     getNextToken();
     auto LHS = MainLoop(), RHS = MainLoop();
-    return ((LHS != nullptr) && (RHS != nullptr)) ? make_unique<BinaryExprAST>(Cur_OP, std::move(LHS), std::move(RHS)) : nullptr;
+    return ((LHS != nullptr) && (RHS != nullptr)) ? make_unique<BinaryExprAST>(Cur_OP, std::move(LHS), std::move(RHS), pos) : nullptr;
 
 }
 
@@ -464,21 +560,21 @@ static std::unique_ptr<ExprAST> MainLoop() {
         switch (CurTok) 
         {
             case TOK_BOOL:
-                result = std::move(make_unique<BoolExprAST>(BoolVal));
+                result = std::move(make_unique<BoolExprAST>(BoolVal, gOpPos));
                 getNextToken();
                 break;
             case TOK_NUMBER:
-                result = std::move(make_unique<NumberExprAST>(NumVal));
+                result = std::move(make_unique<NumberExprAST>(NumVal, gOpPos));
                 getNextToken();
                 break;
             case TOK_VAR:
                 if(IdentifierStr == "a0" || IdentifierStr == "a1" || IdentifierStr == "a2" || IdentifierStr == "a3" || IdentifierStr == "a4" || IdentifierStr == "a5")
                 {
-                    result = make_unique<VariableExprAST>(IdentifierStr);
+                    result = make_unique<VariableExprAST>(IdentifierStr, gOpPos);
                 }
                 else if(IdentifierStr == "m0" ||IdentifierStr == "m1" || IdentifierStr == "m2" || IdentifierStr == "m3" || IdentifierStr == "m4" || IdentifierStr == "m5" || IdentifierStr == "m6" || IdentifierStr == "m7" || IdentifierStr == "m8" || IdentifierStr == "m9")
                 {
-                    result = make_unique<MVariableExprAST>(IdentifierStr);
+                    result = make_unique<MVariableExprAST>(IdentifierStr, gOpPos);
                 }
 
                 getNextToken();
@@ -571,6 +667,12 @@ static int compile() {
     }
 
     initHashTable();
+    // Overflow linkage
+    if(gCheck)
+    {
+        OFT = FunctionType::get(Type::getInt64Ty(C), Type::getInt64Ty(C), false);
+        OF = Function::Create(OFT, Function::ExternalLinkage, "overflow_fail", &*M);
+    }
 
     // Start Parse
     getNextToken();
@@ -584,4 +686,22 @@ static int compile() {
     //return 0;
 }
 
-int main(void) { return compile(); }
+int main(int argc, char** argv) 
+{ 
+    if(1 < argc)
+    {
+        if(NULL != argv[1] && 0 == strcmp("-check", argv[1]))
+        {
+            gCheck = true;
+            gPos = -1;
+            gOpPos = -1;
+        }
+        else
+        {
+            cout << "Invalid parameter, only \"-check\" is accepted." << endl;
+            return -1;
+        }
+    }
+
+    return compile(); 
+}
